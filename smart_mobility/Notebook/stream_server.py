@@ -11,7 +11,6 @@ app = FastAPI()
 
 # Load model once
 model1 = Model1MTCNN()
-model2 = Model2ArcFace()
 model3 = Model3Drowsiness()
 
 @app.get("/")
@@ -39,7 +38,6 @@ async def stream(websocket: WebSocket):
             # ✅ Correct call
             detections = model1.detect(frame)
             frame = model1.draw(frame, detections)
-            frame = model2.process(frame, detections)
             frame = model3.process(frame)
 
 
