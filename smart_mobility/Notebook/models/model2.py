@@ -1,13 +1,14 @@
 import os
 import cv2
 import numpy as np
-from mtcnn import MTCNN
+from retinaface import RetinaFace
 import onnxruntime as ort
 from glob import glob
+from typing import Dict, List, Optional, Tuple
 
-MODEL_DIR = "models"
+MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 ARCFACE_ONNX = os.path.join(MODEL_DIR, "arcface.onnx")
-DATABASE_DIR = "models/database"
+DEFAULT_DB_PATH = os.path.join(MODEL_DIR, "db_embeddings.npz")
 
 THRESHOLD = 0.45
 FACE_SIZE = (112, 112)
@@ -17,7 +18,7 @@ def l2_norm(x, epsilon=1e-10):
     return x / (np.linalg.norm(x) + epsilon)
 
 
-def preprocess_face(face_bgr):
+def preprocess_face(face_bgr: np.ndarray) -> np.ndarray:
     face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
     face_resized = cv2.resize(face_rgb, FACE_SIZE)
     arr = face_resized.astype(np.float32)
@@ -26,181 +27,193 @@ def preprocess_face(face_bgr):
     return arr
 
 
-class Model2ArcFace:
+class ArcFaceModel:
+    """
+    Single model class used for:
+      - building a face database in small chunks (safe on CPU machines)
+      - saving/loading computed embeddings
+      - performing recognition on frames
+    """
 
-    def __init__(self):
-        print("🔵 Loading ArcFace Model...")
-        print("Looking for database at:", os.path.abspath(DATABASE_DIR))
-
-        self.detector = MTCNN()
-
-        self.session = ort.InferenceSession(
-            ARCFACE_ONNX,
-            providers=["CPUExecutionProvider"]
-        )
-
+    def __init__(self,
+                 onnx_path: str = ARCFACE_ONNX,
+                 db_path: Optional[str] = None,
+                 load_db: bool = True):
+        # RetinaFace is used via the static API
+        self.detector = RetinaFace
+        self.session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
 
-        print("✅ ArcFace Model Loaded")
+        # database: mapping name -> normalized embedding (1D np.array)
+        self.db: Dict[str, np.ndarray] = {}
 
-        print("🔵 Building Face Database...")
-        raw_db = self.build_raw_database()
-        self.db = self.compute_database_embeddings(raw_db)
-
-        print("✅ Database Ready")
-        print("=====================================")
-
-    # --------------------------------------
-    # DATABASE BUILDING
-    # --------------------------------------
-
-    def build_raw_database(self):
-        raw_db = {}
-
-        if not os.path.exists(DATABASE_DIR):
-            print("❌ Database folder not found")
-            return raw_db
-
-        persons = [
-            p for p in os.listdir(DATABASE_DIR)
-            if os.path.isdir(os.path.join(DATABASE_DIR, p))
-        ]
-
-        for person in persons:
-            images = glob(os.path.join(DATABASE_DIR, person, "*"))
-            img_list = []
-
-            for path in images:
-                img = cv2.imread(path)
-                if img is not None:
-                    img_list.append(img)
-
-            if img_list:
-                raw_db[person] = img_list
-
-        return raw_db
-
-    def compute_database_embeddings(self, raw_db):
-        db = {}
-
-        for name, images in raw_db.items():
-            embeddings = []
-
-            for img in images:
-                try:
-                    detections = self.detector.detect_faces(img)
-                except Exception:
-                    continue
-
-                if not detections:
-                    continue
-
-                largest = max(
-                    detections,
-                    key=lambda d: d['box'][2] * d['box'][3]
-                )
-
-                x, y, w, h = largest['box']
-
-                x1 = max(0, x)
-                y1 = max(0, y)
-                x2 = min(img.shape[1], x + w)
-                y2 = min(img.shape[0], y + h)
-
-                face = img[y1:y2, x1:x2]
-
-                if face.shape[0] < 50 or face.shape[1] < 50:
-                    continue
-
-                emb = self.get_embedding(face)
-                embeddings.append(emb)
-
-            if embeddings:
-                avg_emb = np.mean(np.stack(embeddings), axis=0)
-                avg_emb = l2_norm(avg_emb)
-                db[name] = avg_emb
-                print(f"[TRAINED] {name} → {len(embeddings)} samples")
+        if db_path and load_db:
+            loaded = self.load_database(db_path)
+            if loaded:
+                print(f"Loaded precomputed DB from: {db_path}")
             else:
-                print(f"[SKIPPED] {name}")
+                print(f"No DB found at {db_path}. Start with empty DB.")
 
-        return db
-
-    # --------------------------------------
-    # EMBEDDING
-    # --------------------------------------
-
-    def get_embedding(self, face):
+    # -------------------------
+    # Embedding helpers
+    # -------------------------
+    def get_embedding(self, face: np.ndarray) -> np.ndarray:
         x = preprocess_face(face)
-
-        emb = self.session.run(
-            [self.output_name],
-            {self.input_name: x}
-        )[0]
-
+        emb = self.session.run([self.output_name], {self.input_name: x})[0]
         emb = emb.reshape(-1)
         emb = l2_norm(emb)
-
         return emb
 
-    # --------------------------------------
-    # RECOGNITION
-    # --------------------------------------
+    # -------------------------
+    # Database persistence
+    # -------------------------
+    def save_database(self, out_path: str = DEFAULT_DB_PATH):
+        """
+        Save current self.db to compressed npz:
+        keys: names (string array), embeddings (float32 array shape (n, dim))
+        """
+        names = list(self.db.keys())
+        if not names:
+            # save an empty placeholder
+            np.savez_compressed(out_path, names=np.array([]), embs=np.array([]))
+            print(f"[SAVE] empty DB -> {out_path}")
+            return
 
-    def recognize(self, embedding):
+        embs = np.stack([self.db[n] for n in names], axis=0).astype(np.float32)
+        np.savez_compressed(out_path, names=np.array(names), embs=embs)
+        print(f"[SAVE] {len(names)} identities -> {out_path}")
+
+    def load_database(self, path: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        data = np.load(path, allow_pickle=True)
+        names = list(data["names"].tolist())
+        embs = data["embs"]
+        if embs.size == 0 or len(names) == 0:
+            self.db = {}
+            return True
+        self.db = {n: embs[i].astype(np.float32) for i, n in enumerate(names)}
+        return True
+
+    # -------------------------
+    # Chunked database builder
+    # -------------------------
+    def build_database_in_chunks(self,
+                                 raw_database_dir: str,
+                                 out_path: str = DEFAULT_DB_PATH,
+                                 chunk_size: int = 10,
+                                 verbose: bool = True):
+        """
+        Iterate over each person folder in raw_database_dir.
+        For each person, process images in small chunks (chunk_size) to limit memory/CPU spikes.
+        After finishing each person, compute average normalized embedding and save the DB file.
+        This ensures progress is persisted frequently.
+        """
+        if not os.path.exists(raw_database_dir):
+            raise FileNotFoundError(f"Database folder not found: {raw_database_dir}")
+
+        persons = [
+            p for p in os.listdir(raw_database_dir)
+            if os.path.isdir(os.path.join(raw_database_dir, p))
+        ]
+
+        print(f"[TRAIN] Found {len(persons)} persons in {raw_database_dir}")
+
+        for idx, person in enumerate(persons, 1):
+            person_path = os.path.join(raw_database_dir, person)
+            images = sorted(glob(os.path.join(person_path, "*")))
+            if not images:
+                if verbose:
+                    print(f"[SKIP] {person} (no images)")
+                continue
+
+            embeddings: List[np.ndarray] = []
+            # process in chunk_size windows
+            for i in range(0, len(images), chunk_size):
+                chunk = images[i:i + chunk_size]
+                for img_path in chunk:
+                    img = cv2.imread(img_path)
+                    if img is None:
+                        continue
+                    try:
+                        detections = RetinaFace.detect_faces(img)
+                    except Exception:
+                        continue
+                    if not detections:
+                        continue
+                    faces = list(detections.values())
+                    largest = max(
+                        faces,
+                        key=lambda d: (d["facial_area"][2] - d["facial_area"][0]) *
+                                      (d["facial_area"][3] - d["facial_area"][1])
+                    )
+                    x1, y1, x2, y2 = largest["facial_area"]
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
+                    face = img[y1:y2, x1:x2]
+                    if face.shape[0] < 50 or face.shape[1] < 50:
+                        continue
+                    emb = self.get_embedding(face)
+                    embeddings.append(emb)
+
+                # after processing the chunk, you can optionally print progress
+                if verbose:
+                    print(f"[{person}] processed {min(i + chunk_size, len(images))}/{len(images)} images")
+
+            if embeddings:
+                avg_emb = np.mean(np.stack(embeddings, axis=0), axis=0)
+                avg_emb = l2_norm(avg_emb)
+                self.db[person] = avg_emb
+                if verbose:
+                    print(f"[TRAINED] {person} -> {len(embeddings)} samples")
+            else:
+                if verbose:
+                    print(f"[SKIPPED] {person} (no usable faces)")
+
+            # Save after each person to persist progress
+            self.save_database(out_path)
+
+        print("[TRAIN] Finished building DB")
+
+    # -------------------------
+    # Recognition
+    # -------------------------
+    def recognize(self, embedding: np.ndarray) -> Tuple[str, float]:
         best_name = "Unknown"
-        best_score = -1
-
+        best_score = -1.0
         for name, db_emb in self.db.items():
-            score = np.dot(embedding, db_emb)
-
+            score = float(np.dot(embedding, db_emb))
             if score > best_score:
                 best_score = score
                 best_name = name
-
         if best_score < THRESHOLD:
             return "Unknown", best_score
-
         return best_name, best_score
 
-    # --------------------------------------
-    # FRAME PROCESSING (WebSocket)
-    # --------------------------------------
-
-    def process(self, frame):
-
+    # -------------------------
+    # Frame processing (prediction)
+    # -------------------------
+    def process(self, frame: np.ndarray) -> np.ndarray:
         try:
-            detections = self.detector.detect_faces(frame)
+            detections = RetinaFace.detect_faces(frame)
         except Exception:
             return frame
 
-        for d in detections:
-            x, y, w, h = d['box']
+        if not detections:
+            return frame
 
-            x1 = max(0, x)
-            y1 = max(0, y)
-            x2 = min(frame.shape[1], x + w)
-            y2 = min(frame.shape[0], y + h)
-
+        for face_data in detections.values():
+            x1, y1, x2, y2 = face_data["facial_area"]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
             face = frame[y1:y2, x1:x2]
-
             if face.shape[0] < 50 or face.shape[1] < 50:
                 continue
-
             emb = self.get_embedding(face)
             name, score = self.recognize(emb)
-
             label = f"{name} | {score:.2f}"
-
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                frame,
-                label,
-                (x1, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2
-            )
-
+            cv2.putText(frame, label, (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         return frame

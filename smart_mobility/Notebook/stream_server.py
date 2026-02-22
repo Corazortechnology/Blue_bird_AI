@@ -1,17 +1,17 @@
 import cv2
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from models.model1 import Model1MTCNN
-from models.model2 import Model2ArcFace
-from models.model3 import Model3Drowsiness
+from models.model1 import Model1RetinaFace
+#from models.model2 import Model2ArcFace
+#from models.model3 import Model3Drowsiness
 
 import uvicorn
 
 app = FastAPI()
 
 # Load model once
-model1 = Model1MTCNN()
-model3 = Model3Drowsiness()
+model1 = Model1RetinaFace()
+#model3 = Model3Drowsiness()
 
 @app.get("/")
 def home():
@@ -38,7 +38,7 @@ async def stream(websocket: WebSocket):
             # ✅ Correct call
             detections = model1.detect(frame)
             frame = model1.draw(frame, detections)
-            frame = model3.process(frame)
+#           frame = model3.process(frame)
 
 
             _, buffer = cv2.imencode(

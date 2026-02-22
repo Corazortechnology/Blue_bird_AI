@@ -1,38 +1,57 @@
 import cv2
-from mtcnn import MTCNN
+from retinaface import RetinaFace
 
-class Model1MTCNN:
-    def __init__(self):
-        print("Loading MTCNN...")
-        self.detector = MTCNN()
-        print("MTCNN loaded.")
+def main():
+    cap = cv2.VideoCapture(0)
 
-    # Only detect faces
-    def detect(self, frame):
+    print("Starting Live Face Detection...")
+    print("Press 'x' to exit")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = cv2.resize(frame, (640, 480))
+
         try:
-            detections = self.detector.detect_faces(frame)
-        except Exception:
-            detections = []
-        return detections
+            detections = RetinaFace.detect_faces(frame)
+        except:
+            detections = {}
 
-    # Draw bounding boxes + keypoints
-    def draw(self, frame, detections):
-        for face in detections:
-            if 'box' not in face:
-                continue
+        if detections:
+            for key in detections:
+                face = detections[key]
 
-            x, y, w, h = face['box']
+                if "facial_area" not in face:
+                    continue
 
-            if w <= 0 or h <= 0:
-                continue
+                x1, y1, x2, y2 = face["facial_area"]
 
-            cv2.rectangle(frame, (x, y),
-                          (x + w, y + h),
-                          (255, 0, 0), 2)
+                cv2.rectangle(frame,
+                              (x1, y1),
+                              (x2, y2),
+                              (0, 255, 0), 2)
 
-            if 'keypoints' in face:
-                for point in face['keypoints'].values():
-                    cv2.circle(frame, point,
-                               4, (0, 255, 0), -1)
+            cv2.putText(frame, "FACE DETECTED",
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1, (0, 255, 0), 2)
 
-        return frame
+        else:
+            cv2.putText(frame, "NO FACE",
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1, (0, 0, 255), 2)
+
+        cv2.imshow("Live Detection", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("x"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
